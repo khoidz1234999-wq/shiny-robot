@@ -1,0 +1,618 @@
+name: Build APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v3
+        with: { gradle-version: 8.5 }
+      - name: Tao project
+        run: |
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_0'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.liquid.assist"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.liquid.assist"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.12.0") }
+          EOF_0
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_1'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <application android:label="@string/app_name" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".FloatingService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="assistive_overlay" />
+                  </service>
+                  <service android:name=".AccSvc" android:exported="true" android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/acc_config" />
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/AccSvc.kt)
+          cat > app/src/main/java/com/liquid/assist/AccSvc.kt <<'EOF_2'
+          package com.liquid.assist
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.media.AudioManager
+          import android.provider.Settings
+          import android.view.KeyEvent
+          import android.view.accessibility.AccessibilityEvent
+          import androidx.core.content.ContextCompat
+          class AccSvc : AccessibilityService() {
+              companion object { var i: AccSvc? = null }
+              override fun onServiceConnected() {
+                  i = this
+                  if (P.b(this, "on", true) && Settings.canDrawOverlays(this))
+                      ContextCompat.startForegroundService(this, Intent(this, FloatingService::class.java))
+              }
+              // Chặn phím âm lượng cứng -> hiện HUD kiểu iOS thay vì HUD của Android
+              override fun onKeyEvent(event: KeyEvent): Boolean {
+                  val k = event.keyCode
+                  if (k != KeyEvent.KEYCODE_VOLUME_UP && k != KeyEvent.KEYCODE_VOLUME_DOWN) return false
+                  val svc = FloatingService.instance ?: return false
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  if (!P.b(this, "hudKeys", true) || am.mode != AudioManager.MODE_NORMAL) return false
+                  if (event.action == KeyEvent.ACTION_DOWN) {
+                      am.adjustStreamVolume(3, if (k == KeyEvent.KEYCODE_VOLUME_UP) 1 else -1, 0)
+                      svc.showVolume()
+                  }
+                  return true
+              }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onUnbind(intent: Intent?): Boolean { i = null; return super.onUnbind(intent) }
+          }
+          EOF_2
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/BootReceiver.kt)
+          cat > app/src/main/java/com/liquid/assist/BootReceiver.kt <<'EOF_3'
+          package com.liquid.assist
+          import android.content.*
+          import android.provider.Settings
+          import androidx.core.content.ContextCompat
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (P.b(c, "on", true) && Settings.canDrawOverlays(c))
+                      ContextCompat.startForegroundService(c, Intent(c, FloatingService::class.java))
+              }
+          }
+          EOF_3
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/FloatingService.kt)
+          cat > app/src/main/java/com/liquid/assist/FloatingService.kt <<'EOF_4'
+          package com.liquid.assist
+          import android.accessibilityservice.AccessibilityService as A
+          import android.animation.ValueAnimator
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.media.AudioManager
+          import android.os.*
+          import android.view.*
+          import android.view.animation.*
+          import android.widget.*
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          class FloatingService : Service() {
+              companion object { var instance: FloatingService? = null }
+              private lateinit var wm: WindowManager
+              private lateinit var am: AudioManager
+              private val h = Handler(Looper.getMainLooper())
+              private var ball: FrameLayout? = null
+              private var ballLp: WindowManager.LayoutParams? = null
+              private var menu: FrameLayout? = null
+              private var hud: FrameLayout? = null
+              private var bar: VolBar? = null
+              private var dragging = false
+              private var sx = 0; private var sy = 0; private var tx = 0f; private var ty = 0f; private var moved = false
+              private val sw get() = resources.displayMetrics.widthPixels
+              private val sh get() = resources.displayMetrics.heightPixels
+              private fun dp(v: Float) = v * resources.displayMetrics.density
+              private fun pi(k: String, d: Int) = P.i(this, k, d)
+              private fun dur(b: Long) = (b * 100f / pi("speed", 100)).toLong()
+              private val ovType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+              private val fl = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+              private val items = listOf(
+                  Triple("🔔", "Thông báo", "notif"), Triple("🔊", "Tăng âm", "volup"), Triple("🎛", "Điều khiển", "quick"),
+                  Triple("🔒", "Khóa", "lock"), Triple("⬤", "Home", "home"), Triple("❐", "Đa nhiệm", "recents"),
+                  Triple("◀", "Quay lại", "back"), Triple("🔉", "Giảm âm", "voldn"), Triple("📷", "Chụp", "shot"))
+
+              private val rx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (i.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) == 3 && !dragging) showVolume()
+                  }
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, id: Int) = START_STICKY
+              override fun onConfigurationChanged(c: android.content.res.Configuration) { super.onConfigurationChanged(c); build() }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("f", "Liquid Assist", NotificationManager.IMPORTANCE_MIN))
+                  val n = Notification.Builder(this, "f").setSmallIcon(android.R.drawable.ic_menu_manage).setContentTitle("Liquid Assist đang chạy").build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE) else startForeground(1, n)
+                  val f = IntentFilter("android.media.VOLUME_CHANGED_ACTION")
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, Context.RECEIVER_EXPORTED) else registerReceiver(rx, f)
+                  build()
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  h.removeCallbacksAndMessages(null)
+                  runCatching { unregisterReceiver(rx) }
+                  closeMenuNow(); removeHud(); ball?.let { runCatching { wm.removeView(it) } }
+                  super.onDestroy()
+              }
+
+              fun refresh(k: String) { if (k == "hud" || k == "hy" || k == "hside") { removeHud(); showVolume() } else build() }
+              fun previewMenu() { openMenu(); h.postDelayed({ closeMenu() }, 1800) }
+
+              private fun build() {
+                  closeMenuNow(); removeHud()
+                  ball?.let { runCatching { wm.removeView(it) } }
+                  addBall()
+              }
+
+              // ---------- HOME ẢO ----------
+              private val fade = Runnable { ball?.animate()?.alpha(pi("opacity", 70) / 100f)?.setDuration(dur(450))?.start() }
+              private fun wake() { h.removeCallbacks(fade); ball?.animate()?.cancel(); ball?.alpha = 1f }
+              private fun sched() { h.removeCallbacks(fade); h.postDelayed(fade, 2500) }
+
+              private fun addBall() {
+                  val s = dp(pi("size", 60).toFloat()).toInt()
+                  val f = FrameLayout(this)
+                  f.addView(Glass(this, Color.argb(120, 20, 24, 40), s * .32f), FrameLayout.LayoutParams(s, s))
+                  val n = (s * .5f).toInt()
+                  f.addView(Glass(this), FrameLayout.LayoutParams(n, n, Gravity.CENTER))
+                  val lp = WindowManager.LayoutParams(s, s, ovType, fl, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = if (pi("side", 1) == 1) sw - s else 0
+                  lp.y = pi("by", 40) * (sh - s) / 100
+                  val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onSingleTapConfirmed(e: MotionEvent): Boolean { openMenu(); return true }
+                      override fun onDoubleTap(e: MotionEvent): Boolean { act("home"); return true }
+                      override fun onLongPress(e: MotionEvent) { act("lock") }
+                  })
+                  f.setOnTouchListener { v, e ->
+                      gd.onTouchEvent(e)
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false; wake()
+                              v.animate().scaleX(.9f).scaleY(.9f).setDuration(dur(120)).start()
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              if (abs(e.rawX - tx) > 12 || abs(e.rawY - ty) > 12) moved = true
+                              if (moved) { lp.x = (sx + e.rawX - tx).toInt(); lp.y = (sy + e.rawY - ty).toInt(); wm.updateViewLayout(f, lp) }
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              v.animate().scaleX(1f).scaleY(1f).setDuration(dur(200)).setInterpolator(OvershootInterpolator(2f)).start()
+                              if (moved) snap() else sched()
+                          }
+                      }
+                      true
+                  }
+                  wm.addView(f, lp); ball = f; ballLp = lp; sched()
+              }
+
+              private fun snap() {
+                  val f = ball ?: return; val lp = ballLp ?: return; val s = lp.width
+                  val tgx = if (lp.x + s / 2 < sw / 2) 0 else sw - s
+                  val tgy = lp.y.coerceIn(0, sh - s)
+                  val x0 = lp.x; val y0 = lp.y
+                  ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = dur(380); interpolator = OvershootInterpolator(1.2f)
+                      addUpdateListener {
+                          val t = it.animatedValue as Float
+                          lp.x = (x0 + (tgx - x0) * t).toInt(); lp.y = (y0 + (tgy - y0) * t).toInt()
+                          runCatching { wm.updateViewLayout(f, lp) }
+                      }
+                      start()
+                  }
+                  P.si(this, "side", if (tgx == 0) 0 else 1); P.si(this, "by", tgy * 100 / (sh - s))
+                  sched()
+              }
+
+              // ---------- MENU ----------
+              private fun openMenu() {
+                  if (menu != null) return
+                  wake()
+                  val ps = dp(262f * pi("menu", 100) / 100f).toInt()
+                  val pad = dp(14f).toInt(); val cs = (ps - pad * 2) / 3
+                  val root = FrameLayout(this)
+                  root.setOnClickListener { closeMenu() }
+                  val panel = FrameLayout(this); panel.isClickable = true
+                  panel.addView(Glass(this, Color.argb(110, 18, 22, 38), dp(38f)), FrameLayout.LayoutParams(ps, ps))
+                  val grid = GridLayout(this); grid.columnCount = 3
+                  panel.addView(grid, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                  items.forEachIndexed { i, t ->
+                      val cell = FrameLayout(this); val m = dp(4f).toInt()
+                      cell.addView(Glass(this, if (t.third == "home") Color.argb(70, 255, 255, 255) else 0, cs * .3f),
+                          FrameLayout.LayoutParams(cs - m * 2, cs - m * 2, Gravity.CENTER))
+                      val ll = LinearLayout(this); ll.orientation = LinearLayout.VERTICAL; ll.gravity = Gravity.CENTER
+                      ll.addView(TextView(this).apply { text = t.first; textSize = 24f; setTextColor(Color.WHITE); gravity = Gravity.CENTER })
+                      ll.addView(TextView(this).apply { text = t.second; textSize = 10f; setTextColor(Color.argb(210, 255, 255, 255)); gravity = Gravity.CENTER })
+                      cell.addView(ll, FrameLayout.LayoutParams(-1, -1))
+                      cell.setOnClickListener { closeMenu { act(t.third) } }
+                      grid.addView(cell, GridLayout.LayoutParams().apply { width = cs; height = cs })
+                      cell.scaleX = .5f; cell.scaleY = .5f; cell.alpha = 0f
+                      cell.animate().scaleX(1f).scaleY(1f).alpha(1f).setStartDelay(dur(70) + i * dur(30)).setDuration(dur(300))
+                          .setInterpolator(OvershootInterpolator(1.3f)).start()
+                  }
+                  root.addView(panel, FrameLayout.LayoutParams(ps, ps, Gravity.CENTER))
+                  val lp = WindowManager.LayoutParams(-1, -1, ovType,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT)
+                  wm.addView(root, lp); menu = root
+                  val bl = ballLp!!
+                  panel.pivotX = ps / 2f; panel.pivotY = ps / 2f
+                  panel.scaleX = .2f; panel.scaleY = .2f; panel.alpha = 0f
+                  panel.translationX = bl.x + bl.width / 2f - sw / 2f; panel.translationY = bl.y + bl.height / 2f - sh / 2f
+                  panel.animate().scaleX(1f).scaleY(1f).alpha(1f).translationX(0f).translationY(0f)
+                      .setDuration(dur(420)).setInterpolator(OvershootInterpolator(1.05f)).start()
+                  scrim(root, 0, 90)
+                  ball?.animate()?.alpha(0f)?.setDuration(dur(200))?.start()
+              }
+
+              private fun scrim(v: View, a: Int, b: Int) = ValueAnimator.ofInt(a, b).apply {
+                  duration = dur(350); addUpdateListener { v.setBackgroundColor(Color.argb(it.animatedValue as Int, 0, 0, 0)) }; start()
+              }
+
+              private fun closeMenu(after: (() -> Unit)? = null) {
+                  val root = menu ?: return; menu = null
+                  val panel = root.getChildAt(0); val bl = ballLp!!
+                  scrim(root, 90, 0)
+                  panel.animate().scaleX(.2f).scaleY(.2f).alpha(0f)
+                      .translationX(bl.x + bl.width / 2f - sw / 2f).translationY(bl.y + bl.height / 2f - sh / 2f)
+                      .setDuration(dur(260)).setInterpolator(AccelerateInterpolator()).withEndAction {
+                          runCatching { wm.removeView(root) }
+                          ball?.animate()?.alpha(1f)?.setDuration(dur(150))?.start(); sched()
+                          after?.invoke()
+                      }.start()
+              }
+
+              private fun closeMenuNow() { menu?.let { runCatching { wm.removeView(it) } }; menu = null }
+
+              private fun act(k: String) {
+                  if (P.b(this, "haptic", true)) ball?.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                  if (k == "volup" || k == "voldn") { am.adjustStreamVolume(3, if (k == "volup") 1 else -1, 0); showVolume(); return }
+                  val a = AccSvc.i ?: run { Toast.makeText(this, "Hãy bật Trợ năng cho ứng dụng", Toast.LENGTH_SHORT).show(); return }
+                  a.performGlobalAction(when (k) {
+                      "home" -> A.GLOBAL_ACTION_HOME; "back" -> A.GLOBAL_ACTION_BACK; "recents" -> A.GLOBAL_ACTION_RECENTS
+                      "notif" -> A.GLOBAL_ACTION_NOTIFICATIONS; "quick" -> A.GLOBAL_ACTION_QUICK_SETTINGS
+                      "lock" -> A.GLOBAL_ACTION_LOCK_SCREEN; "shot" -> A.GLOBAL_ACTION_TAKE_SCREENSHOT
+                      else -> return
+                  })
+              }
+
+              // ---------- HUD ÂM LƯỢNG ----------
+              private val hideHud = Runnable {
+                  val f = hud ?: return@Runnable; hud = null; bar = null
+                  val left = pi("hside", 0) == 0
+                  f.animate().alpha(0f).scaleX(.6f).scaleY(.6f).translationX((if (left) -1 else 1) * f.width * .8f)
+                      .setDuration(dur(260)).setInterpolator(AccelerateInterpolator()).withEndAction { runCatching { wm.removeView(f) } }.start()
+              }
+
+              private fun removeHud() { h.removeCallbacks(hideHud); hud?.let { runCatching { wm.removeView(it) } }; hud = null; bar = null }
+
+              private fun setTouch(y: Float, ht: Int) {
+                  val t = (1f - y / ht).coerceIn(0f, 1f)
+                  am.setStreamVolume(3, (t * am.getStreamMaxVolume(3)).roundToInt(), 0); bar?.go(t, 0, true)
+              }
+
+              fun showVolume() {
+                  val lv = am.getStreamVolume(3) / am.getStreamMaxVolume(3).toFloat()
+                  if (hud == null) addHud(lv) else if (!dragging) bar?.go(lv, dur(220))
+                  h.removeCallbacks(hideHud); if (!dragging) h.postDelayed(hideHud, 1900)
+              }
+
+              private fun addHud(lv: Float) {
+                  val hs = pi("hud", 100) / 100f
+                  val w = dp(64f * hs).toInt(); val ht = dp(196f * hs).toInt()
+                  val left = pi("hside", 0) == 0
+                  val f = FrameLayout(this)
+                  f.addView(Glass(this, Color.argb(95, 20, 24, 40), w / 2f), FrameLayout.LayoutParams(w, ht))
+                  val b = VolBar(this); b.go(lv, 0, true); f.addView(b, FrameLayout.LayoutParams(w, ht)); bar = b
+                  val lp = WindowManager.LayoutParams(w, ht, ovType, fl, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  val m = dp(12f).toInt()
+                  lp.x = if (left) m else sw - w - m
+                  lp.y = (sh - ht) * pi("hy", 50) / 100
+                  f.pivotX = if (left) 0f else w.toFloat(); f.pivotY = ht / 2f
+                  f.alpha = 0f; f.scaleX = .6f; f.scaleY = .6f; f.translationX = (if (left) -1 else 1) * w * .8f
+                  f.setOnTouchListener { v, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              dragging = true; h.removeCallbacks(hideHud)
+                              v.animate().scaleX(1.07f).scaleY(1.04f).setDuration(dur(150)).start(); setTouch(e.y, ht)
+                          }
+                          MotionEvent.ACTION_MOVE -> setTouch(e.y, ht)
+                          else -> {
+                              dragging = false
+                              v.animate().scaleX(1f).scaleY(1f).setDuration(dur(200)).setInterpolator(OvershootInterpolator(2f)).start()
+                              h.postDelayed(hideHud, 1900)
+                          }
+                      }
+                      true
+                  }
+                  wm.addView(f, lp); hud = f
+                  f.animate().alpha(1f).scaleX(1f).scaleY(1f).translationX(0f).setDuration(dur(380))
+                      .setInterpolator(OvershootInterpolator(.9f)).start()
+              }
+          }
+          EOF_4
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/MainActivity.kt)
+          cat > app/src/main/java/com/liquid/assist/MainActivity.kt <<'EOF_5'
+          package com.liquid.assist
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.res.ColorStateList
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.*
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : Activity() {
+              private lateinit var col: LinearLayout
+              private val refs = mutableListOf<() -> Unit>()
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun glass(r: Int = 22, a: Int = 38) = GradientDrawable().apply {
+                  setColor(Color.argb(a, 255, 255, 255)); cornerRadius = dp(r).toFloat(); setStroke(dp(1), Color.argb(90, 255, 255, 255))
+              }
+              private fun tv(t: String, sz: Float, al: Int = 255, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = sz; setTextColor(Color.argb(al, 255, 255, 255)); if (bold) typeface = Typeface.DEFAULT_BOLD
+              }
+              private fun card() = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; background = glass(); setPadding(dp(16), dp(14), dp(16), dp(14))
+                  layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) }
+              }
+              private fun btn(t: String, f: () -> Unit) = tv(t, 14f, 255, true).apply {
+                  background = glass(16, 70); setPadding(dp(16), dp(9), dp(16), dp(9)); gravity = Gravity.CENTER; setOnClickListener { f() }
+              }
+              private fun perm(t: String, d: String, ok: (() -> Boolean)?, act: () -> Unit) {
+                  val c = card(); c.addView(tv(t, 16f, 255, true)); c.addView(tv(d, 12f, 170))
+                  val b = btn("", act); b.layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(10) }; c.addView(b)
+                  refs.add { val g = ok?.invoke(); b.text = if (ok == null) "Mở cài đặt" else if (g == true) "✓ Đã bật" else "Cấp quyền"; b.alpha = if (g == true) .6f else 1f }
+                  col.addView(c)
+              }
+              private fun seek(t: String, k: String, mn: Int, mx: Int, d: Int, u: String) {
+                  val c = card(); val v = tv("${P.i(this, k, d)}$u", 14f, 200); val top = LinearLayout(this)
+                  top.addView(tv(t, 15f, 255, true), LinearLayout.LayoutParams(0, -2, 1f)); top.addView(v); c.addView(top)
+                  val s = SeekBar(this); s.max = mx - mn; s.progress = P.i(this, k, d) - mn
+                  s.progressTintList = ColorStateList.valueOf(Color.WHITE); s.thumbTintList = ColorStateList.valueOf(Color.WHITE)
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar, p: Int, user: Boolean) {
+                          val x = p + mn; v.text = "$x$u"
+                          if (user) { P.si(this@MainActivity, k, x); FloatingService.instance?.refresh(k) }
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar) {}
+                      override fun onStopTrackingTouch(sb: SeekBar) {}
+                  })
+                  c.addView(s); col.addView(c)
+              }
+              private fun swt(t: String, k: String, d: Boolean, f: ((Boolean) -> Unit)? = null) {
+                  val c = card(); val s = Switch(this); s.text = t; s.setTextColor(Color.WHITE); s.textSize = 15f; s.isChecked = P.b(this, k, d)
+                  s.setOnCheckedChangeListener { _, on -> P.sb(this, k, on); f?.invoke(on) }
+                  c.addView(s); col.addView(c)
+              }
+              private fun side(t: String, k: String, d: Int, l0: String, l1: String) {
+                  val c = card(); c.addView(tv(t, 15f, 255, true)); val r = LinearLayout(this)
+                  var upd: () -> Unit = {}
+                  val bs = listOf(l0, l1).mapIndexed { i, l ->
+                      btn(l) { P.si(this, k, i); upd(); FloatingService.instance?.refresh(k) }.also {
+                          r.addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { topMargin = dp(8); marginEnd = dp(6) })
+                      }
+                  }
+                  upd = { bs.forEachIndexed { i, b -> b.alpha = if (P.i(this, k, d) == i) 1f else .45f } }
+                  upd(); c.addView(r); col.addView(c)
+              }
+              private fun startSvc() {
+                  if (Settings.canDrawOverlays(this)) ContextCompat.startForegroundService(this, Intent(this, FloatingService::class.java))
+                  else Toast.makeText(this, "Cần cấp quyền hiển thị trên ứng dụng khác", Toast.LENGTH_SHORT).show()
+              }
+              private fun oemAutostart() {
+                  val l = listOf("com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+                      "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+                      "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+                      "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+                      "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity")
+                  for ((p, c) in l) try { startActivity(Intent().setComponent(ComponentName(p, c))); return } catch (e: Exception) {}
+                  startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val sv = ScrollView(this)
+                  sv.background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(0xFF0A0F2C.toInt(), 0xFF2E1A6B.toInt(), 0xFF0B6E7A.toInt()))
+                  col = LinearLayout(this); col.orientation = LinearLayout.VERTICAL; col.setPadding(dp(16), dp(52), dp(16), dp(40))
+                  sv.addView(col); setContentView(sv)
+                  col.addView(tv("Liquid Assist", 30f, 255, true))
+                  col.addView(tv("Home ảo & âm lượng kiểu iOS 26 · Liquid Glass", 13f, 170))
+                  perm("Hiển thị trên ứng dụng khác", "Bắt buộc để Home ảo và thanh âm lượng nổi lên trên mọi app.",
+                      { Settings.canDrawOverlays(this) }) { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }
+                  perm("Trợ năng", "Để Home/Quay lại/Đa nhiệm/Thông báo/Khóa/Chụp màn hình và bắt phím âm lượng cứng.",
+                      { AccSvc.i != null }) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  perm("Không giới hạn pin", "Giúp Home ảo không bị hệ thống tắt.",
+                      { (getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName) }) {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  }
+                  perm("Tự khởi động (Autostart)", "Bật Autostart cho app (Xiaomi/Oppo/Vivo/Huawei/Samsung).", null) { oemAutostart() }
+                  swt("Bật Home ảo", "on", true) { on -> if (on) startSvc() else stopService(Intent(this, FloatingService::class.java)) }
+                  swt("Dùng thanh âm lượng iOS cho phím cứng", "hudKeys", true)
+                  swt("Rung phản hồi", "haptic", true)
+                  side("Vị trí thanh âm lượng", "hside", 0, "Bên trái", "Bên phải")
+                  seek("Vị trí thanh âm lượng (lên/xuống)", "hy", 5, 95, 50, "%")
+                  seek("Kích thước thanh âm lượng", "hud", 70, 150, 100, "%")
+                  seek("Kích thước Home ảo", "size", 36, 96, 60, "dp")
+                  seek("Kích thước menu Home", "menu", 80, 130, 100, "%")
+                  seek("Tốc độ animation", "speed", 50, 250, 100, "%")
+                  seek("Độ mờ khi nghỉ", "opacity", 25, 100, 70, "%")
+                  val r = LinearLayout(this); r.layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) }
+                  r.addView(btn("Thử âm lượng") { FloatingService.instance?.showVolume() }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+                  r.addView(btn("Thử menu Home") { FloatingService.instance?.previewMenu() }, LinearLayout.LayoutParams(0, -2, 1f))
+                  col.addView(r)
+                  col.addView(tv("Chạm: mở menu · Chạm 2 lần: Home · Giữ: Khóa màn hình · Kéo: di chuyển & tự hít cạnh", 12f, 150).apply { setPadding(0, dp(14), 0, 0) })
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+              }
+
+              override fun onResume() {
+                  super.onResume(); refs.forEach { it() }
+                  if (P.b(this, "on", true) && Settings.canDrawOverlays(this) && FloatingService.instance == null) startSvc()
+              }
+          }
+          EOF_5
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/P.kt)
+          cat > app/src/main/java/com/liquid/assist/P.kt <<'EOF_6'
+          package com.liquid.assist
+          import android.content.Context
+          object P {
+              private fun sp(c: Context) = c.getSharedPreferences("p", 0)
+              fun i(c: Context, k: String, d: Int) = sp(c).getInt(k, d)
+              fun b(c: Context, k: String, d: Boolean) = sp(c).getBoolean(k, d)
+              fun si(c: Context, k: String, v: Int) = sp(c).edit().putInt(k, v).apply()
+              fun sb(c: Context, k: String, v: Boolean) = sp(c).edit().putBoolean(k, v).apply()
+          }
+          EOF_6
+          mkdir -p $(dirname app/src/main/java/com/liquid/assist/Views.kt)
+          cat > app/src/main/java/com/liquid/assist/Views.kt <<'EOF_7'
+          package com.liquid.assist
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.*
+          import android.view.View
+          import android.view.animation.DecelerateInterpolator
+
+          /** Kính lỏng: nền mờ + highlight bán kính + viền sáng chuyển màu */
+          class Glass(c: Context, private val tint: Int = 0, private val rad: Float = -1f) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private fun a(x: Int) = Color.argb(x, 255, 255, 255)
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val r = if (rad < 0) minOf(w, h) / 2 else rad
+                  val rc = RectF(2f, 2f, w - 2f, h - 2f)
+                  p.style = Paint.Style.FILL
+                  if (tint != 0) { p.shader = null; p.color = tint; cv.drawRoundRect(rc, r, r, p) }
+                  p.shader = LinearGradient(0f, 0f, 0f, h, intArrayOf(a(70), a(22), a(46)), null, Shader.TileMode.CLAMP)
+                  cv.drawRoundRect(rc, r, r, p)
+                  p.shader = RadialGradient(w * .28f, h * .18f, maxOf(w, h) * .75f, a(95), a(0), Shader.TileMode.CLAMP)
+                  cv.drawRoundRect(rc, r, r, p)
+                  p.style = Paint.Style.STROKE; p.strokeWidth = 2.5f
+                  p.shader = LinearGradient(0f, 0f, w, h, intArrayOf(a(230), a(20), a(150)), null, Shader.TileMode.CLAMP)
+                  cv.drawRoundRect(rc, r, r, p)
+              }
+          }
+
+          /** Thanh âm lượng dọc kiểu iOS: fill trắng từ dưới lên + loa đổi sóng theo mức */
+          class VolBar(c: Context) : View(c) {
+              var level = 0f
+              private var anim: ValueAnimator? = null
+              private val fp = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val ip = Paint(Paint.ANTI_ALIAS_FLAG)
+              fun go(t: Float, d: Long, instant: Boolean = false) {
+                  anim?.cancel()
+                  if (instant) { level = t; invalidate(); return }
+                  anim = ValueAnimator.ofFloat(level, t).apply {
+                      duration = d; interpolator = DecelerateInterpolator()
+                      addUpdateListener { level = it.animatedValue as Float; invalidate() }; start()
+                  }
+              }
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val clip = Path().apply { addRoundRect(RectF(0f, 0f, w, h), w / 2, w / 2, Path.Direction.CW) }
+                  cv.save(); cv.clipPath(clip)
+                  fp.shader = LinearGradient(0f, 0f, 0f, h, Color.argb(250, 255, 255, 255), Color.argb(215, 232, 238, 255), Shader.TileMode.CLAMP)
+                  cv.drawRect(0f, h * (1 - level), w, h, fp)
+                  cv.restore()
+                  val s = w * .12f; val cx = w / 2 - s * 1.25f; val cy = h - w * .52f
+                  ip.shader = null
+                  ip.color = if (level > .12f) Color.argb(215, 40, 44, 60) else Color.WHITE
+                  ip.style = Paint.Style.FILL
+                  val p = Path()
+                  p.moveTo(cx - s * 1.3f, cy - s * .7f); p.lineTo(cx - s * .5f, cy - s * .7f); p.lineTo(cx + s * .5f, cy - s * 1.5f)
+                  p.lineTo(cx + s * .5f, cy + s * 1.5f); p.lineTo(cx - s * .5f, cy + s * .7f); p.lineTo(cx - s * 1.3f, cy + s * .7f); p.close()
+                  cv.drawPath(p, ip)
+                  ip.style = Paint.Style.STROKE; ip.strokeWidth = s * .45f; ip.strokeCap = Paint.Cap.ROUND
+                  val n = when { level <= 0f -> 0; level < .34f -> 1; level < .67f -> 2; else -> 3 }
+                  for (i in 1..n) {
+                      val r = s * (.9f + .8f * i)
+                      cv.drawArc(RectF(cx + s * .5f - r, cy - r, cx + s * .5f + r, cy + r), -42f, 84f, false, ip)
+                  }
+                  if (n == 0) cv.drawLine(cx + s * 1.2f, cy - s * .8f, cx + s * 2.4f, cy + s * .8f, ip)
+              }
+          }
+          EOF_7
+          mkdir -p $(dirname app/src/main/res/values/strings.xml)
+          cat > app/src/main/res/values/strings.xml <<'EOF_8'
+          <resources>
+              <string name="app_name">Liquid Assist</string>
+              <string name="acc_desc">Cho phép Home ảo thực hiện Home, Quay lại, Đa nhiệm, Thông báo, Khóa màn hình, Chụp màn hình và hiển thị thanh âm lượng kiểu iOS.</string>
+          </resources>
+          EOF_8
+          mkdir -p $(dirname app/src/main/res/xml/acc_config.xml)
+          cat > app/src/main/res/xml/acc_config.xml <<'EOF_9'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents"
+              android:canRequestFilterKeyEvents="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          EOF_9
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_10'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF_10
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_11'
+          android.useAndroidX=true
+          EOF_11
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_12'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "LiquidAssist"
+          include(":app")
+          EOF_12
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with: { name: LiquidAssist-apk, path: app/build/outputs/apk/debug/*.apk }
